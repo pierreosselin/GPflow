@@ -23,13 +23,13 @@ from ..inducing_variables import InducingPoints
 from ..kernels import Kernel
 from ..likelihoods import Likelihood
 from ..mean_functions import MeanFunction
-from ..models.model import Data, GPModel, MeanAndVariance
+from ..models.model import RegressionData, GPModel, MeanAndVariance
 from ..utilities import to_default_float
 from .util import inducingpoint_wrapper
 
 
 class SGPMC(GPModel):
-    """
+    r"""
     This is the Sparse Variational GP using MCMC (SGPMC). The key reference is
 
     ::
@@ -48,20 +48,20 @@ class SGPMC(GPModel):
     .. math::
        :nowrap:
 
-       \\begin{align}
-       \\mathbf v & \\sim N(0, \\mathbf I) \\\\
-       \\mathbf u &= \\mathbf L\\mathbf v
-       \\end{align}
+       \begin{align}
+       \mathbf v & \sim N(0, \mathbf I) \\
+       \mathbf u &= \mathbf L\mathbf v
+       \end{align}
 
     with
 
     .. math::
-        \\mathbf L \\mathbf L^\\top = \\mathbf K
+        \mathbf L \mathbf L^\top = \mathbf K
 
 
     """
     def __init__(self,
-                 data: Data,
+                 data: RegressionData,
                  kernel: Kernel,
                  likelihood: Likelihood,
                  mean_function: Optional[MeanFunction] = None,
@@ -79,14 +79,23 @@ class SGPMC(GPModel):
         self.V = Parameter(np.zeros((len(self.inducing_variable), self.num_latent)))
         self.V.prior = tfp.distributions.Normal(loc=to_default_float(0.), scale=to_default_float(1.))
 
-    def log_likelihood(self, *args, **kwargs) -> tf.Tensor:
+    def training_loss(self, data: Optional[RegressionData] = None) -> tf.Tensor:
+        return - (self.log_likelihood(data) + self.log_prior())
+
+    def target_log_prob_fn(self):
+        return self.log_likelihood() + self.log_prior()
+
+    def log_likelihood(self, data: Optional[RegressionData] = None) -> tf.Tensor:
         """
         This function computes the optimal density for v, q*(v), up to a constant
         """
         # get the (marginals of) q(f): exactly predicting!
-        x_data, y_data = self.data
-        fmean, fvar = self.predict_f(x_data, full_cov=False)
-        return tf.reduce_sum(self.likelihood.variational_expectations(fmean, fvar, y_data))
+        if data is None:
+            data = self.data
+        X_data, Y_data = data
+        fmean, fvar = self.predict_f(X_data, full_cov=False)
+        var_exps = self.likelihood.variational_expectations(fmean, fvar, Y_data)
+        return tf.reduce_sum(var_exps)
 
     def predict_f(self, X: tf.Tensor, full_cov=False, full_output_cov=False) -> MeanAndVariance:
         """

@@ -14,7 +14,7 @@
 
 import abc
 import warnings
-from typing import Optional, Tuple, TypeVar
+from typing import Callable, Optional, Tuple, TypeVar
 
 import numpy as np
 import tensorflow as tf
@@ -26,23 +26,16 @@ from ..likelihoods import Likelihood
 from ..mean_functions import MeanFunction, Zero
 from ..utilities import ops
 
-Data = TypeVar('Data', Tuple[tf.Tensor, tf.Tensor], tf.Tensor)
-DataPoint = tf.Tensor
+InputData = tf.Tensor
+OutputData = tf.Tensor
+RegressionData = Tuple[InputData, OutputData]
+ClusteringData = InputData
+Data = TypeVar('Data', RegressionData, ClusteringData)
 MeanAndVariance = Tuple[tf.Tensor, tf.Tensor]
 
 
 class BayesianModel(Module):
     """ Bayesian model. """
-
-    def neg_log_marginal_likelihood(self, *args, **kwargs) -> tf.Tensor:
-        msg = "`BayesianModel.neg_log_marginal_likelihood` is deprecated and " \
-              " and will be removed in a future release. Please update your code " \
-              " to use `BayesianModel.log_marginal_likelihood`."
-        warnings.warn(msg, category=DeprecationWarning)
-        return - self.log_marginal_likelihood(*args, **kwargs)
-
-    def log_marginal_likelihood(self, *args, **kwargs) -> tf.Tensor:
-        return self.log_likelihood(*args, **kwargs) + self.log_prior()
 
     def log_prior(self) -> tf.Tensor:
         log_priors = [p.log_prior() for p in self.trainable_parameters]
@@ -51,29 +44,40 @@ class BayesianModel(Module):
         else:
             return tf.convert_to_tensor(0., dtype=default_float())
 
+    @property
     @abc.abstractmethod
-    def log_likelihood(self, *args, **kwargs) -> tf.Tensor:
+    def has_own_data(self) -> bool:
         raise NotImplementedError
+
+    @abc.abstractmethod
+    def training_loss(self, data: Optional[Data] = None) -> tf.Tensor:
+        raise NotImplementedError
+
+    def training_loss_closure(self, data: Optional[Data] = None) -> Callable[[], tf.Tensor]:
+        def training_loss_closure():
+            return self.training_loss(data)
+
+        return training_loss_closure
 
 
 class GPModel(BayesianModel):
     r"""
-    A stateless base class for Gaussian process models, that is, those of the form
+    A stateless base class for Gaussian process models, that is, those of the
+    form
 
     .. math::
        :nowrap:
 
-       \\begin{align}
-       \\theta & \sim p(\\theta) \\\\
-       f       & \sim \\mathcal{GP}(m(x), k(x, x'; \\theta)) \\\\
-       f_i       & = f(x_i) \\\\
-       y_i\,|\,f_i     & \sim p(y_i|f_i)
-       \\end{align}
+       \begin{align}
+           \theta        & \sim p(\theta) \\
+           f             & \sim \mathcal{GP}(m(x), k(x, x'; \theta)) \\
+           f_i           & = f(x_i) \\
+           y_i \,|\, f_i & \sim p(y_i|f_i)
+       \end{align}
 
-    This class mostly adds functionality to compile predictions. To use it,
-    inheriting classes must define a predict_f function, which computes
-    the means and variances of the latent function. Its usage is similar to log_likelihood in the
-    Model class.
+    This class mostly adds functionality for predictions. To use it, inheriting
+    classes must define a predict_f function, which computes the means and
+    variances of the latent function.
 
     These predictions are then pushed through the likelihood to obtain means
     and variances of held out data, self.predict_y.
@@ -81,6 +85,8 @@ class GPModel(BayesianModel):
     The predictions can also be used to compute the (log) density of held-out
     data via self.predict_log_density.
 
+    It is also possible to draw samples from the latent GPs using
+    self.predict_f_samples.
     """
 
     def __init__(self,
@@ -98,19 +104,19 @@ class GPModel(BayesianModel):
         self.likelihood = likelihood
 
     @abc.abstractmethod
-    def predict_f(self, predict_at: DataPoint, full_cov: bool = False,
+    def predict_f(self, Xnew: InputData, full_cov: bool = False,
                   full_output_cov: bool = False) -> MeanAndVariance:
         raise NotImplementedError
 
     def predict_f_samples(self,
-                          predict_at: DataPoint,
+                          Xnew: InputData,
                           num_samples: int = 1,
                           full_cov: bool = True,
                           full_output_cov: bool = False) -> tf.Tensor:
         """
         Produce samples from the posterior latent function(s) at the input points.
         """
-        mu, var = self.predict_f(predict_at, full_cov=full_cov)  # [N, P], [P, N, N]
+        mu, var = self.predict_f(Xnew, full_cov=full_cov)  # [N, P], [P, N, N]
         num_latent = var.shape[0]
         num_elems = tf.shape(var)[1]
         var_jitter = ops.add_to_diagonal(var, default_jitter())
@@ -120,18 +126,18 @@ class GPModel(BayesianModel):
         mu_t = tf.linalg.adjoint(mu)  # [P, N]
         return tf.transpose(mu_t[..., np.newaxis] + LV)  # [S, N, P]
 
-    def predict_y(self, predict_at: DataPoint, full_cov: bool = False,
+    def predict_y(self, Xnew: InputData, full_cov: bool = False,
                   full_output_cov: bool = False) -> MeanAndVariance:
         """
         Compute the mean and variance of the held-out data at the input points.
         """
-        f_mean, f_var = self.predict_f(predict_at, full_cov=full_cov, full_output_cov=full_output_cov)
+        f_mean, f_var = self.predict_f(Xnew, full_cov=full_cov, full_output_cov=full_output_cov)
         return self.likelihood.predict_mean_and_var(f_mean, f_var)
 
-    def predict_log_density(self, data: Data, full_cov: bool = False, full_output_cov: bool = False):
+    def predict_log_density(self, data: RegressionData, full_cov: bool = False, full_output_cov: bool = False):
         """
         Compute the log density of the data at the new data points.
         """
-        x, y = data
-        f_mean, f_var = self.predict_f(x, full_cov=full_cov, full_output_cov=full_output_cov)
-        return self.likelihood.predict_density(f_mean, f_var, y)
+        X, Y = data
+        f_mean, f_var = self.predict_f(X, full_cov=full_cov, full_output_cov=full_output_cov)
+        return self.likelihood.predict_density(f_mean, f_var, Y)

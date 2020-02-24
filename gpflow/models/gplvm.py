@@ -27,7 +27,7 @@ from ..probability_distributions import DiagonalGaussian
 from ..utilities import positive
 from ..utilities.ops import pca_reduce
 from .gpr import GPR
-from .model import GPModel
+from .model import ClusteringData, GPModel
 from .util import inducingpoint_wrapper
 
 
@@ -36,7 +36,7 @@ class GPLVM(GPR):
     Standard GPLVM where the likelihood can be optimised with respect to the latent X.
     """
     def __init__(self,
-                 data: tf.Tensor,
+                 data: ClusteringData,
                  latent_dim: int,
                  x_data_mean: Optional[tf.Tensor] = None,
                  kernel: Optional[Kernel] = None,
@@ -73,7 +73,7 @@ class GPLVM(GPR):
 
 class BayesianGPLVM(GPModel):
     def __init__(self,
-                 data: tf.Tensor,
+                 data: ClusteringData,
                  x_data_mean: tf.Tensor,
                  x_data_var: tf.Tensor,
                  kernel: Kernel,
@@ -133,14 +133,22 @@ class BayesianGPLVM(GPModel):
         assert self.x_prior_var.shape[0] == self.num_data
         assert self.x_prior_var.shape[1] == self.num_latent
 
-    def log_likelihood(self):
+    @property
+    def has_own_data(self):
+        return True
+
+    def training_loss(self, data: Optional[ClusteringData] = None):
+        return - (self.elbo(data) + self.log_prior())
+
+    def elbo(self, data: Optional[ClusteringData] = None):
         """
         Construct a tensorflow function to compute the bound on the marginal
         likelihood.
         """
+        y_data = data if data is not None else self.data
+
         pX = DiagonalGaussian(self.x_data_mean, self.x_data_var)
 
-        y_data = self.data
         num_inducing = len(self.inducing_variable)
         psi0 = tf.reduce_sum(expectation(pX, self.kernel))
         psi1 = expectation(pX, (self.kernel, self.inducing_variable))
@@ -180,7 +188,7 @@ class BayesianGPLVM(GPModel):
         bound -= KL
         return bound
 
-    def predict_f(self, predict_at: tf.Tensor, full_cov: bool = False, full_output_cov: bool = False):
+    def predict_f(self, Xnew: tf.Tensor, full_cov: bool = False, full_output_cov: bool = False):
         """
         Compute the mean and variance of the latent function at some new points.
         Note that this is very similar to the SGPR prediction, for which
@@ -188,9 +196,11 @@ class BayesianGPLVM(GPModel):
 
         Note: This model does not allow full output covariances.
 
-        :param predict_at: Point to predict at.
+        :param Xnew: points at which to predict
         """
-        assert full_output_cov == False
+        if full_output_cov:
+            raise NotImplementedError
+
         pX = DiagonalGaussian(self.x_data_mean, self.x_data_var)
 
         y_data = self.data
@@ -200,7 +210,7 @@ class BayesianGPLVM(GPModel):
                                          (self.kernel, self.inducing_variable)),
                              axis=0)
         jitter = default_jitter()
-        Kus = covariances.Kuf(self.inducing_variable, self.kernel, predict_at)
+        Kus = covariances.Kuf(self.inducing_variable, self.kernel, Xnew)
         sigma2 = self.likelihood.variance
         sigma = tf.sqrt(sigma2)
         L = tf.linalg.cholesky(covariances.Kuu(self.inducing_variable, self.kernel, jitter=jitter))
@@ -215,13 +225,16 @@ class BayesianGPLVM(GPModel):
         tmp2 = tf.linalg.triangular_solve(LB, tmp1, lower=True)
         mean = tf.linalg.matmul(tmp2, c, transpose_a=True)
         if full_cov:
-            var = self.kernel(predict_at) + tf.linalg.matmul(tmp2, tmp2, transpose_a=True) \
+            var = self.kernel(Xnew) + tf.linalg.matmul(tmp2, tmp2, transpose_a=True) \
                   - tf.linalg.matmul(tmp1, tmp1, transpose_a=True)
             shape = tf.stack([1, 1, tf.shape(y_data)[1]])
             var = tf.tile(tf.expand_dims(var, 2), shape)
         else:
-            var = self.kernel(predict_at, full=False) + tf.reduce_sum(tf.square(tmp2), 0) - tf.reduce_sum(
+            var = self.kernel(Xnew, full=False) + tf.reduce_sum(tf.square(tmp2), 0) - tf.reduce_sum(
                 tf.square(tmp1), 0)
             shape = tf.stack([1, tf.shape(y_data)[1]])
             var = tf.tile(tf.expand_dims(var, 1), shape)
-        return mean + self.mean_function(predict_at), var
+        return mean + self.mean_function(Xnew), var
+
+    def predict_log_density(self, data: ClusteringData):
+        raise NotImplementedError
